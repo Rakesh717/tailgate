@@ -1,0 +1,19 @@
+#!/bin/sh
+# tailgate: command-line interface to Tailgate.app. Installed as a symlink,
+# /usr/local/bin/tailgate -> Tailgate.app/Contents/Resources/tailgate, so it
+# follows the app; `tailgate help` lists the commands.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case "$link" in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+app=$(cd "$(dirname "$self")/../.." && pwd)
+if [ ! -x "$app/Contents/MacOS/Tailgate" ]; then
+  echo "tailgate: Tailgate.app has moved or been removed" >&2
+  exit 127
+fi
+# A VS Code terminal's ELECTRON_RUN_AS_NODE would reach T3 Code via the app.
+exec env -u ELECTRON_RUN_AS_NODE "$app/Contents/MacOS/Tailgate" --cli "$@"

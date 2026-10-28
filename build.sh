@@ -25,7 +25,7 @@ lipo -create build/obj/Tailgate-arm64 build/obj/Tailgate-x86_64 -output "$BIN"
 cp Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD" "$APP/Contents/Info.plist"
-cp doctor.sh install-helper.sh Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp doctor.sh install-helper.sh bin/tailgate Resources/AppIcon.icns "$APP/Contents/Resources/"
 
 IDENTITY="${SIGN_IDENTITY:--}"
 if [ "$IDENTITY" = - ]; then

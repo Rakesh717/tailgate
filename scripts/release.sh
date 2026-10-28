@@ -39,7 +39,7 @@ else
     echo "note: not notarized. Users must right-click → Open the first time." >&2
 fi
 
-# --- zip (for Homebrew) and checksums
+# --- zip (what `tailgate update` downloads) and checksums
 ditto -c -k --keepParent build/Tailgate.app "$ZIP"
 ( cd "$OUT" && shasum -a 256 "Tailgate-$VERSION.dmg" "Tailgate-$VERSION.zip" > SHA256SUMS )
 

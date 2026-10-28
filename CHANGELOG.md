@@ -1,22 +1,51 @@
 # Changelog
 
-## Unreleased
-- The QR code is now a one-time T3 Code pairing link (expires after 10 minutes),
-  so a new phone or tablet is signed in by scanning it. **Pair a device…** makes
-  a new one; turning Remote access off or quitting revokes it.
-- Remote access stays on when Tailscale or T3 Code drops, and Tailgate brings
-  them back in the background instead of switching off with sleep still blocked.
-- Tailscale and T3 Code are started in the background without taking focus;
-  T3 Code's real port is read from its runtime file.
-- `tailscale up` keeps existing settings such as `--accept-routes` instead of
-  failing.
-- On launch, a sleep block left behind by a killed earlier run is undone.
-- `doctor.sh` checks that T3 Code's server is actually running (offering to
-  restart the app when it is open without it) and that pairing links can be made.
+## 0.1.0
+First release.
 
-## 1.0.0
-- Menu bar app: keeps the Mac awake with the lid closed, makes sure Tailscale is
-  connected and T3 Code is running, and shares T3 Code on the tailnet with a QR code.
-- Requirement rows for Tailscale and T3 Code (installed, running, signed in) and a
-  `doctor.sh` health check with `--fix`.
-- Universal binary (Apple silicon + Intel), hardened runtime, DMG release script.
+**Menu bar app**
+- **Remote access** keeps the Mac awake with the lid closed and shares T3 Code
+  on your tailnet over HTTPS (plain HTTP on :8080 if the tailnet has no
+  certificates). It picks a free tailnet port (443, then 8443, 10000, 4443)
+  and never takes over something else you serve.
+- Turning it on opens Tailscale and turns it on (keeping settings such as
+  `--accept-routes`), and starts T3 Code in the background without taking focus,
+  restarting it when it's open without its server.
+- The QR code is a one-time T3 Code pairing link (10 minutes), so scanning it
+  signs a phone or tablet in; **Pair a device…** makes another. Paired devices
+  just open the address shown.
+- While it's on, Tailgate brings back Tailscale or T3 Code if either is closed
+  or turned off. If it can't, or setup is needed (e.g. logged out), Remote
+  access turns off and the popover says why.
+- Turning off or quitting revokes the pairing link, removes only Tailgate's own
+  share and restores normal sleep, including a share Tailscale wouldn't remove
+  while it was off and a sleep block left by a killed earlier run.
+- Tailscale and T3 Code rows: red is a setup problem (not installed, not logged
+  in or signed in) with **Fix in Terminal…**; orange is just not running, which
+  Remote access handles. Status updates every 5 seconds and when either app
+  starts or quits.
+- Turns itself off at 15% battery when unplugged.
+- Preferences via `defaults`: `batteryCutoff`, `servePort`, `pairingMinutes`,
+  `checkForUpdates`.
+- Checks GitHub for a newer release daily and shows **Update available** with
+  **Install…** (`tailgate update`).
+- Works with the Tailscale Mac app or a Homebrew CLI-only install.
+
+**Command line**
+- `tailgate` (`/usr/local/bin/tailgate`, a symlink into the app): `status`,
+  `on`, `off`, `pair` (QR code in the terminal), `fix`, `doctor`, `start`,
+  `quit`, `update`, `uninstall`. On, off and pair go through the running app, so the menu
+  and the terminal always agree.
+- `tailgate update` downloads the latest release, verifies its checksum,
+  signature and version, swaps the app in place and relaunches it.
+- `tailgate fix` / `doctor` (`doctor.sh`) checks and repairs Tailscale, T3 Code
+  (installed, server running, signed in, an agent provider, pairing) and
+  Tailgate itself.
+
+**Install**
+- One admin prompt installs the sleep helper
+  (`/usr/local/libexec/tailgate-helper`), a narrow `sudoers` rule and the
+  `tailgate` command. `install.sh` and the app's first toggle both do it;
+  `tailgate uninstall` removes everything.
+- Universal binary (Apple silicon + Intel), hardened runtime, DMG and zip
+  release script.

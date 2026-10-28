@@ -1,16 +1,29 @@
 #!/bin/sh
-# Installs the root-side helper and a narrow sudoers rule so the menu bar app
-# can toggle lid sleep without prompting every time.
+# Installs, as root (the app runs this behind its one admin prompt):
+#   /usr/local/libexec/tailgate-helper  toggles lid sleep; a narrow sudoers rule
+#                                       lets the app run it without a password
+#   /usr/local/bin/tailgate             the command-line tool (a symlink into the app)
 # Safe to re-run.
+#
+#   sudo sh install-helper.sh [/path/to/Tailgate.app] [user]
+# The app defaults to the one this script sits in; the user to whoever ran sudo.
 set -eu
-USER_NAME="${SUDO_USER:-$(id -un)}"
+here=$(cd "$(dirname "$0")" && pwd)
+case "$here" in
+  */Contents/Resources) APP_DEFAULT=$(cd "$here/../.." && pwd) ;;
+  *) APP_DEFAULT="" ;;
+esac
+APP="${1:-$APP_DEFAULT}"
+USER_NAME="${2:-${SUDO_USER:-$(id -un)}}"
+HELPER=/usr/local/libexec/tailgate-helper
+CLI=/usr/local/bin/tailgate
 
-# retire the helper from when this app was called RemoteAccess
-rm -f /usr/local/sbin/remote-access /etc/sudoers.d/remote-access
+# retire earlier helpers: RemoteAccess's, and /usr/local/sbin/tailgate, which
+# shared its name with the command-line tool
+rm -f /usr/local/sbin/remote-access /etc/sudoers.d/remote-access /usr/local/sbin/tailgate
 
-install -d -o root -g wheel -m 0755 /usr/local/sbin
-
-cat > /usr/local/sbin/tailgate <<'HELPER'
+install -d -o root -g wheel -m 0755 /usr/local/libexec
+cat > "$HELPER" <<'HELPER'
 #!/bin/sh
 set -eu
 case "${1:-}" in
@@ -23,17 +36,26 @@ case "${1:-}" in
       echo off
     fi
     ;;
-  *) echo "usage: tailgate on|off|status" >&2; exit 64 ;;
+  *) echo "usage: tailgate-helper on|off|status" >&2; exit 64 ;;
 esac
 HELPER
-
-chown root:wheel /usr/local/sbin/tailgate
-chmod 0755 /usr/local/sbin/tailgate
+chown root:wheel "$HELPER"
+chmod 0755 "$HELPER"
 
 TMP="$(mktemp /tmp/tailgate.sudoers.XXXXXX)"
-printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/tailgate on, /usr/local/sbin/tailgate off, /usr/local/sbin/tailgate status\n' "$USER_NAME" > "$TMP"
+printf '%s ALL=(root) NOPASSWD: %s on, %s off, %s status\n' "$USER_NAME" "$HELPER" "$HELPER" "$HELPER" > "$TMP"
 chown root:wheel "$TMP"
 chmod 0440 "$TMP"
 /usr/sbin/visudo -cf "$TMP" >/dev/null
 mv "$TMP" /etc/sudoers.d/tailgate
+
+# The command-line tool. Never replace a file that isn't our symlink.
+if [ -n "$APP" ] && [ -x "$APP/Contents/Resources/tailgate" ]; then
+  install -d -o root -g wheel -m 0755 /usr/local/bin
+  if [ -e "$CLI" ] && [ ! -L "$CLI" ]; then
+    echo "note: $CLI exists and isn't a symlink; left it alone" >&2
+  else
+    ln -sfn "$APP/Contents/Resources/tailgate" "$CLI"
+  fi
+fi
 echo ok

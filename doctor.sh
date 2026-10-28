@@ -2,7 +2,7 @@
 # Checks that everything Tailgate exists to serve is installed and signed in:
 #   Tailscale  – installed, daemon running, logged in, key not expiring
 #   T3 Code    – installed, server up, signed in, a provider logged in
-#   Tailgate   – root helper + sudoers rule present
+#   Tailgate   – app, sleep helper + sudoers rule, the tailgate command
 #
 #   ./doctor.sh          report only (exit 1 if anything is broken)
 #   ./doctor.sh --fix    offer to install / log in / start what is missing
@@ -294,33 +294,55 @@ fi
 
 # ─────────────────────────────────────────────────────────── Tailgate
 head_ "Tailgate"
-HELPER=/usr/local/sbin/tailgate
+# The app: the one this script ships in, else an installed copy.
+case "$(cd "$(dirname "$0")" && pwd)" in
+  */Contents/Resources) TG_APP=$(cd "$(dirname "$0")/../.." && pwd) ;;
+  *) TG_APP=$(find_app Tailgate || true) ;;
+esac
+HELPER=/usr/local/libexec/tailgate-helper
+CLI=/usr/local/bin/tailgate
+# One sudo call installs the helper, its sudoers rule and the command.
+tg_install() { [ -n "$TG_APP" ] && sudo /bin/sh "$TG_APP/Contents/Resources/install-helper.sh" "$TG_APP" "$(id -un)" >/dev/null; }
+TG_HINT="sudo sh \"${TG_APP:-/Applications/Tailgate.app}/Contents/Resources/install-helper.sh\""
+
+if [ -n "$TG_APP" ]; then ok "app: $TG_APP"; else bad "app not installed"; hint "./install.sh, or drag Tailgate.app to Applications"; fi
+
 if [ -x "$HELPER" ] && [ -f /etc/sudoers.d/tailgate ]; then
-  ok "root helper and sudoers rule installed"
   HOUT=$(sudo -n "$HELPER" status 2>&1)
   REAL=off; pmset -g | grep -q 'SleepDisabled[[:space:]]*1' && REAL=on
   if [ "$HOUT" = "$REAL" ]; then
-    ok "passwordless toggle works (lid sleep currently: $HOUT)"
-  elif [ "$HOUT" = on ] || [ "$HOUT" = off ]; then
-    bad "helper reports '$HOUT' but pmset says '$REAL' (outdated helper)"
-    if ask "reinstall helper (needs sudo)?"; then
-      sudo /bin/sh "$(dirname "$0")/install-helper.sh" && ok "reinstalled" || bad "reinstall failed"
-    else
-      hint "sudo /bin/sh ./install-helper.sh"
-    fi
+    ok "sleep helper works (lid sleep currently: $HOUT)"
   else
-    bad "helper failed: $HOUT"
-    hint "re-run: sudo /bin/sh $(dirname "$0")/install-helper.sh"
+    bad "sleep helper failed: $HOUT"
+    if ask "reinstall it (needs your password)?"; then
+      if tg_install; then fixed "reinstalled"; else still "reinstall failed"; fi
+    else
+      hint "$TG_HINT"
+    fi
   fi
 else
-  warn "helper not installed yet (the app installs it on first toggle)"
-  if ask "install it now (needs sudo)?"; then
-    sudo /bin/sh "$(dirname "$0")/install-helper.sh" && ok "installed" || bad "install failed"
+  warn "sleep helper not installed yet (the app installs it on first toggle)"
+  if ask "install it now (needs your password)?"; then
+    tg_install && ok "installed" || still "install failed"
   else
-    hint "sudo /bin/sh ./install-helper.sh"
+    hint "$TG_HINT"
   fi
 fi
-if [ -d "$HOME/Applications/Tailgate.app" ]; then ok "app: ~/Applications/Tailgate.app"; else warn "app not installed: run ./install.sh"; fi
+
+if [ -n "$TG_APP" ]; then
+  if [ "$(readlink "$CLI" 2>/dev/null)" = "$TG_APP/Contents/Resources/tailgate" ]; then
+    ok "command: $CLI"
+  elif [ -e "$CLI" ] && [ ! -L "$CLI" ]; then
+    warn "$CLI is some other program; Tailgate's command is $TG_APP/Contents/Resources/tailgate"
+  else
+    warn "the tailgate command isn't installed"
+    if ask "install it (needs your password)?"; then
+      tg_install && ok "installed $CLI" || still "install failed"
+    else
+      hint "$TG_HINT"
+    fi
+  fi
+fi
 
 # Let a running Tailgate show the new state now instead of on its next check.
 pgrep -x Tailgate >/dev/null 2>&1 && open -g "tailgate://refresh" >/dev/null 2>&1
