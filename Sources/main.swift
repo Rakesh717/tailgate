@@ -529,10 +529,38 @@ func qrImage(_ text: String, scale: CGFloat = 8) -> NSImage? {
 
 // MARK: - UI
 
+/// Menu bar glyph: the logo's nested arches. Solid with a core dot when on,
+/// faint arches only when off. Template image, so it follows light/dark.
+func menuBarGlyph(on: Bool) -> NSImage {
+    let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+        let cx: CGFloat = 9, y0: CGFloat = 3.5, leg: CGFloat = 2.5
+        NSColor.black.setStroke()
+        NSColor.black.setFill()
+        for (i, r) in [CGFloat(3.0), 6.2].enumerated() {
+            let arch = NSBezierPath()
+            arch.move(to: NSPoint(x: cx - r, y: y0))
+            arch.line(to: NSPoint(x: cx - r, y: y0 + leg))
+            arch.appendArc(withCenter: NSPoint(x: cx, y: y0 + leg), radius: r, startAngle: 180, endAngle: 0, clockwise: true)
+            arch.line(to: NSPoint(x: cx + r, y: y0))
+            arch.lineWidth = 1.9
+            arch.lineCapStyle = .round
+            NSGraphicsContext.current?.cgContext.setAlpha(on ? 1 : (i == 0 ? 0.55 : 0.4))
+            arch.stroke()
+        }
+        if on {
+            NSGraphicsContext.current?.cgContext.setAlpha(1)
+            NSBezierPath(ovalIn: NSRect(x: cx - 1.5, y: y0 - 1.5, width: 3, height: 3)).fill()
+        }
+        return true
+    }
+    image.isTemplate = true
+    return image
+}
+
 struct MenuBarLabel: View {
     @ObservedObject var model: RemoteController
     var body: some View {
-        Image(systemName: model.enabled ? "antenna.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
+        Image(nsImage: menuBarGlyph(on: model.enabled))
     }
 }
 
