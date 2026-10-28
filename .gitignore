@@ -1,0 +1,22 @@
+# build output
+build/
+dist/
+.build/
+*.dmg
+*.zip
+
+# macOS / editors
+.DS_Store
+.AppleDouble
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# never commit signing material
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+.env
+.env.*
