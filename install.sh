@@ -21,7 +21,9 @@ cp -R build/Tailgate.app "$DEST/"
 
 pkill -f "Tailgate.app/Contents/MacOS/Tailgate" 2>/dev/null || true
 sleep 1
-open "$DEST/Tailgate.app"
+# Don't pass a VS Code terminal's ELECTRON_RUN_AS_NODE on to the app (and from
+# there to T3 Code, which won't start with it).
+env -u ELECTRON_RUN_AS_NODE open "$DEST/Tailgate.app"
 echo "installed: $DEST/Tailgate.app"
 
 echo

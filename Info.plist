@@ -24,6 +24,17 @@
     <string>public.app-category.utilities</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Tailgate asks Terminal to run its setup check, and uses administrator authorization once to install the sleep helper.</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.rakesh717.tailgate</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>tailgate</string>
+            </array>
+        </dict>
+    </array>
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>

@@ -20,10 +20,13 @@ for a in "$@"; do
 done
 
 if [ -t 1 ]; then G=$(printf '\033[32m'); Y=$(printf '\033[33m'); R=$(printf '\033[31m'); D=$(printf '\033[2m'); N=$(printf '\033[0m'); else G=; Y=; R=; D=; N=; fi
-FAILS=0; WARNS=0
+FAILS=0; WARNS=0; FIXED=0
 ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$1"; }
 warn() { printf '  %s!%s %s\n' "$Y" "$N" "$1"; WARNS=$((WARNS+1)); }
 bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$1"; FAILS=$((FAILS+1)); }
+# After a repair attempt for a problem bad() already counted:
+fixed() { ok "$1"; FAILS=$((FAILS-1)); FIXED=$((FIXED+1)); }
+still() { printf '  %s✗%s %s\n' "$R" "$N" "$1"; }
 hint() { printf '    %s%s%s\n' "$D" "$1" "$N"; }
 head_() { printf '\n%s\n' "$1"; }
 
@@ -62,6 +65,23 @@ find_ts() {
   return 1
 }
 ts_state() { "$TS" status --json 2>/dev/null | sed -n 's/.*"BackendState": *"\([A-Za-z]*\)".*/\1/p' | head -1; }
+# With the Tailscale app quit, the state can still read "Running" while this
+# Mac is offline, so "connected" needs the app up and Self.Online too.
+ts_gui() { pgrep -f 'Tailscale\.app/Contents/MacOS/Tailscale$' >/dev/null 2>&1; }
+ts_online() { [ "$("$TS" status --json 2>/dev/null | plutil -extract Self.Online raw -o - - 2>/dev/null)" = true ]; }
+ts_up() { # ts_up <timeout>
+  # `up` refuses to run unless every non-default setting (e.g. --accept-routes)
+  # is repeated; it prints the exact command that keeps them, so run that.
+  # Output streams through tee so a login URL shows up while `up` waits.
+  log=$(mktemp)
+  "$TS" up --timeout="$1" 2>&1 | tee "$log"
+  args=$(sed -n '/requires mentioning all/,$ s/^[[:space:]]*tailscale up\(.*\)$/\1/p' "$log" | tail -1)
+  rm -f "$log"
+  [ -n "$args" ] || return 0
+  hint "retrying with your current settings: tailscale up$args"
+  eval "set -- $args"
+  "$TS" up "$@"
+}
 
 head_ "Tailscale"
 find_ts
@@ -88,17 +108,35 @@ if [ -n "$TS" ]; then
       hint "open -a Tailscale"
     fi
   fi
+  if [ -n "$TS_APP" ] && ! ts_gui; then
+    bad "app not running (this Mac is offline without it)"
+    if ask "start Tailscale?"; then
+      open -g -a Tailscale
+      wait_for 20 ts_gui && fixed "started" && wait_for 20 ts_online
+      STATE=$(ts_state)
+    else
+      hint "open -a Tailscale"
+    fi
+  fi
+  # Its state means nothing while the app is closed; that was reported above.
+  [ -n "$TS_APP" ] && ! ts_gui && STATE=AppClosed
   case "$STATE" in
+    AppClosed) ;;
     Running)
-      ok "logged in and connected"
+      if ts_online; then
+        ok "logged in and connected"
+      else
+        bad "logged in, but this Mac is offline"
+        hint "open the Tailscale menu and check it says Connected"
+      fi
       ;;
     NeedsLogin|NoState|"")
       [ -n "$STATE" ] && bad "not logged in ($STATE)"
       if ask "start login now?"; then
         # --timeout keeps `up` from hanging forever; it prints/opens the auth URL.
-        "$TS" up --timeout=120s || true
+        ts_up 120s || true
         STATE=$(ts_state)
-        [ "$STATE" = Running ] && ok "logged in and connected" || bad "still not connected ($STATE)"
+        if [ "$STATE" = Running ]; then fixed "logged in and connected"; else still "still not connected ($STATE)"; fi
       else
         [ -n "$STATE" ] && hint "tailscale up   (or sign in from the menu bar icon)"
       fi
@@ -106,8 +144,8 @@ if [ -n "$TS" ]; then
     Stopped)
       bad "logged in but turned off"
       if ask "run tailscale up?"; then
-        "$TS" up --timeout=60s || true
-        [ "$(ts_state)" = Running ] && ok "connected" || bad "still stopped"
+        ts_up 60s || true
+        if [ "$(ts_state)" = Running ]; then fixed "connected"; else still "still stopped"; fi
       else
         hint "tailscale up"
       fi
@@ -162,32 +200,42 @@ fi
 if [ -n "$T3_APP" ]; then
   ok "app: $T3_APP ($(plist_ver "$T3_APP"))"
 
-  t3_running() { ps -axo command= | grep -qF "$T3_APP/Contents/MacOS/"; }
-  if t3_running; then
-    ok "app running"
+  # Match the executable path exactly: grepping full command lines also
+  # matches this grep, whose own arguments contain the path.
+  T3_EXE="$T3_APP/Contents/MacOS/$(basename "$T3_APP" .app)"
+  t3_running() { ps -axo comm= | grep -qxF "$T3_EXE"; }
+  t3_stopped() { ! t3_running; }
+  # The server writes its pid/port here while it runs and removes it on exit.
+  RT="$T3_HOME/userdata/server-runtime.json"
+  t3_server() {
+    [ -f "$RT" ] || return 1
+    PID=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$RT")
+    PORT=$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$RT")
+    [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && nc -z 127.0.0.1 "${PORT:-0}" 2>/dev/null
+  }
+  # `open` hands this shell's environment to the app, and an inherited
+  # ELECTRON_RUN_AS_NODE (e.g. from a VS Code terminal) makes it exit at once.
+  t3_start() { env -u ELECTRON_RUN_AS_NODE open -g "$T3_APP" && wait_for 45 t3_server; }
+
+  if t3_server; then
+    ok "server listening on 127.0.0.1:$PORT"
+    T3_PORT=$PORT
+  elif t3_running; then
+    bad "app is open but its server isn't running"
+    if ask "restart T3 Code?"; then
+      osascript -e "quit app \"$T3_APP\"" >/dev/null 2>&1
+      wait_for 15 t3_stopped
+      if t3_start; then fixed "restarted, server on 127.0.0.1:$PORT"; T3_PORT=$PORT; else still "server still not running"; fi
+    else
+      hint "quit T3 Code and open it again"
+    fi
   else
-    warn "app not running"
-    if ask "launch T3 Code?"; then
-      open "$T3_APP"; wait_for 20 t3_running && ok "launched" || bad "failed to launch"
+    bad "not running"
+    if ask "start T3 Code?"; then
+      if t3_start; then fixed "started, server on 127.0.0.1:$PORT"; T3_PORT=$PORT; else still "server did not start"; fi
     else
       hint "open \"$T3_APP\""
     fi
-  fi
-
-  # The server records its pid/port here once it is up.
-  RT="$T3_HOME/userdata/server-runtime.json"
-  if [ -f "$RT" ]; then
-    PID=$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$RT")
-    PORT=$(sed -n 's/.*"port": *\([0-9]*\).*/\1/p' "$RT")
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && nc -z 127.0.0.1 "${PORT:-0}" 2>/dev/null; then
-      ok "server listening on 127.0.0.1:$PORT"
-      T3_PORT=$PORT
-    else
-      warn "server not running (stale $RT)"
-      hint "start the T3 Code app; it starts the server"
-    fi
-  else
-    warn "server has never run (no $RT)"
   fi
 
   # Account sign-in
@@ -223,14 +271,23 @@ if [ -n "$T3_APP" ]; then
     bad "no agent provider available (install and log in to Claude Code, Codex or OpenCode)"
   fi
 
-  # Is the T3 server reachable from the tailnet?
+  # Tailgate mints device pairing links through the CLI bundled in the app.
+  if [ -n "${T3_PORT:-}" ]; then
+    T3_CLI="$T3_APP/Contents/Resources/app.asar/apps/server/dist/bin.mjs"
+    if ELECTRON_RUN_AS_NODE=1 T3CODE_HOME="$T3_HOME" "$T3_EXE" "$T3_CLI" auth pairing list --json >/dev/null 2>&1; then
+      ok "device pairing available"
+    else
+      bad "can't create pairing links (T3 Code CLI failed)"
+      hint "ELECTRON_RUN_AS_NODE=1 \"$T3_EXE\" \"$T3_CLI\" auth pairing list"
+    fi
+  fi
+
+  # Sharing is Tailgate's job; this only reports it.
   if [ -n "$TS" ] && [ "$(ts_state)" = Running ] && [ -n "${T3_PORT:-}" ]; then
     if "$TS" serve status 2>/dev/null | grep -q ":$T3_PORT"; then
-      ok "exposed to your tailnet via Tailscale Serve"
+      ok "shared on your tailnet"
     else
-      warn "T3 is only on localhost; phones/tablets on your tailnet can't reach it"
-      hint "enable the Tailscale option in T3 Code settings, or run:"
-      hint "tailscale serve --bg $T3_PORT"
+      hint "not shared on your tailnet yet: turn on Remote access in Tailgate"
     fi
   fi
 fi
@@ -265,8 +322,12 @@ else
 fi
 if [ -d "$HOME/Applications/Tailgate.app" ]; then ok "app: ~/Applications/Tailgate.app"; else warn "app not installed: run ./install.sh"; fi
 
+# Let a running Tailgate show the new state now instead of on its next check.
+pgrep -x Tailgate >/dev/null 2>&1 && open -g "tailgate://refresh" >/dev/null 2>&1
+
 # ─────────────────────────────────────────────────────────── Summary
 printf '\n'
+[ "$FIXED" -gt 0 ] && printf '%sFixed %d problem(s).%s\n' "$G" "$FIXED" "$N"
 if [ "$FAILS" -gt 0 ]; then
   printf '%s%d problem(s)%s, %d warning(s).' "$R" "$FAILS" "$N" "$WARNS"
   [ "$FIX" -eq 0 ] && printf ' Run ./doctor.sh --fix to repair interactively.'

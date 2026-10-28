@@ -16,18 +16,20 @@ private var tailscaleBin: String {
         ?? "/usr/local/bin/tailscale"
 }
 private var tailscaleInstalled: Bool { FileManager.default.isExecutableFile(atPath: tailscaleBin) }
-private let t3BundleName = "T3 Code (Beta)"
-private let t3Port = 3773
+private let t3Home = NSHomeDirectory() + "/.t3"
+private let t3DefaultPort = 3773
+private let pairingTTL = "10m"
 private let drainCutoff = 15
 private let fallbackHTTPPort = 8080
 
 // MARK: - Process helpers
 
 @discardableResult
-private func runSync(_ path: String, _ args: [String]) -> (status: Int32, out: String) {
+private func runSync(_ path: String, _ args: [String], env: [String: String]? = nil) -> (status: Int32, out: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
+    if let env { p.environment = env }
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
@@ -42,11 +44,13 @@ private func runSync(_ path: String, _ args: [String]) -> (status: Int32, out: S
 }
 
 /// Runs a process with a hard timeout, so a stuck command can never wedge the toggle.
-private func runTimed(_ path: String, _ args: [String], _ timeout: TimeInterval) async -> (Int32, String) {
+private func runTimed(_ path: String, _ args: [String], _ timeout: TimeInterval,
+                      env: [String: String]? = nil) async -> (Int32, String) {
     await withCheckedContinuation { (cont: CheckedContinuation<(Int32, String), Never>) in
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
+        if let env { p.environment = env }
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = pipe
@@ -88,11 +92,19 @@ private func portListening(_ port: Int) -> Bool {
 
 // MARK: - State
 
+/// With the Tailscale app quit, the backend can still say "Running" while this
+/// Mac is offline, so "connected" also needs the app up and Self.Online.
 struct TailscaleState {
     var backend = "Unknown"
+    var online = false
+    var appRunning = false
     var dnsName: String?
     var certDomains: [String] = []
-    var running: Bool { backend == "Running" }
+    var running: Bool { backend == "Running" && online && appRunning }
+}
+
+private func tailscaleAppRunning() -> Bool {
+    NSWorkspace.shared.runningApplications.contains { $0.bundleURL?.path.hasSuffix("/Tailscale.app") == true }
 }
 
 enum StepStatus: Equatable {
@@ -112,24 +124,108 @@ struct Requirement: Equatable {
     var text: String
 }
 
-private func t3AppInstalled() -> Bool {
+struct Pairing {
+    let id: String
+    let url: String
+    let expires: Date
+}
+
+/// The installed T3 Code app, e.g. "/Applications/T3 Code (Beta).app".
+private func t3AppPath() -> String? {
     let fm = FileManager.default
-    return ["/Applications", NSHomeDirectory() + "/Applications"].contains { dir in
-        ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
-            .contains { $0.hasPrefix("T3 Code") && $0.hasSuffix(".app") }
+    for dir in ["/Applications", NSHomeDirectory() + "/Applications"] {
+        if let name = ((try? fm.contentsOfDirectory(atPath: dir)) ?? [])
+            .first(where: { $0.hasPrefix("T3 Code") && $0.hasSuffix(".app") }) {
+            return dir + "/" + name
+        }
     }
+    return nil
+}
+
+private func t3AppRunning(_ app: String) -> Bool {
+    NSWorkspace.shared.runningApplications.contains { $0.bundleURL?.path == app }
+}
+
+/// Port of the running T3 server. It writes server-runtime.json while up and
+/// removes it on exit; the app window can be open without it.
+private func t3ServerPort() -> Int? {
+    guard let data = FileManager.default.contents(atPath: t3Home + "/userdata/server-runtime.json"),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let port = obj["port"] as? Int,
+          let pid = obj["pid"] as? Int, kill(pid_t(pid), 0) == 0,
+          portListening(port) else { return nil }
+    return port
 }
 
 /// Signed in to T3 Code itself (the account token it writes after login).
 private func t3SignedIn() -> Bool {
-    let path = NSHomeDirectory() + "/.t3/userdata/clerk-tokens.json"
+    let path = t3Home + "/userdata/clerk-tokens.json"
     let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
     return (size ?? 0) > 0
 }
 
+/// The CLI bundled in the T3 Code app, invoked the way its ~/.t3/bin/t3 shim does.
+private func t3CLI(_ app: String, _ args: [String]) -> (exe: String, args: [String], env: [String: String]) {
+    let name = ((app as NSString).lastPathComponent as NSString).deletingPathExtension
+    var env = ProcessInfo.processInfo.environment
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    env["T3CODE_HOME"] = t3Home
+    return (app + "/Contents/MacOS/" + name,
+            [app + "/Contents/Resources/app.asar/apps/server/dist/bin.mjs"] + args,
+            env)
+}
+
+private func parsePairing(_ out: String) -> Pairing? {
+    guard let start = out.firstIndex(of: "{"), let end = out.lastIndex(of: "}"),
+          let obj = try? JSONSerialization.jsonObject(with: Data(out[start...end].utf8)) as? [String: Any],
+          let id = obj["id"] as? String,
+          let url = obj["pairUrl"] as? String,
+          let expires = obj["expiresAt"] as? String else { return nil }
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return Pairing(id: id, url: url, expires: iso.date(from: expires) ?? Date().addingTimeInterval(600))
+}
+
+/// Splits a command line into words, honouring single and double quotes.
+private func shellWords(_ line: String) -> [String] {
+    var words: [String] = []
+    var current = ""
+    var quote: Character?
+    var inWord = false
+    for ch in line {
+        if let q = quote {
+            if ch == q { quote = nil } else { current.append(ch) }
+        } else if ch == "\"" || ch == "'" {
+            quote = ch
+            inWord = true
+        } else if ch == " " || ch == "\t" {
+            if inWord { words.append(current); current = ""; inWord = false }
+        } else {
+            current.append(ch)
+            inWord = true
+        }
+    }
+    if inWord { words.append(current) }
+    return words
+}
+
+/// `tailscale up` refuses to run unless every non-default setting (e.g.
+/// --accept-routes) is repeated. It prints the exact command that keeps them,
+/// so run that instead of resetting the user's settings.
+private func tailscaleUp(wait: TimeInterval) async {
+    let r = await runTimed(tailscaleBin, ["up", "--timeout=\(Int(wait))s"], wait + 10)
+    guard r.1.contains("requires mentioning all"),
+          let line = r.1.split(separator: "\n")
+              .map({ $0.trimmingCharacters(in: .whitespaces) })
+              .last(where: { $0.hasPrefix("tailscale up ") }) else { return }
+    _ = await runTimed(tailscaleBin, Array(shellWords(line).dropFirst()), wait + 10)
+}
+
 private func tailscaleRequirement(_ ts: TailscaleState) -> Requirement {
     guard tailscaleInstalled else { return .init(level: .bad, text: "Not installed") }
+    guard ts.appRunning else { return .init(level: .warn, text: "Not running — Remote access starts it") }
     switch ts.backend {
+    case "Running" where !ts.online: return .init(level: .bad, text: "Running, but this Mac is offline")
     case "Running": return .init(level: .ok, text: "Connected" + (ts.dnsName.map { " as \($0.split(separator: ".").first ?? "")" } ?? ""))
     case "NeedsLogin": return .init(level: .bad, text: "Not logged in")
     case "Stopped": return .init(level: .bad, text: "Logged in but turned off")
@@ -139,9 +235,13 @@ private func tailscaleRequirement(_ ts: TailscaleState) -> Requirement {
     }
 }
 
-private func t3Requirement(listening: Bool) -> Requirement {
-    guard t3AppInstalled() else { return .init(level: .bad, text: "Not installed") }
-    guard listening else { return .init(level: .warn, text: "Installed, not running") }
+private func t3Requirement(port: Int?) -> Requirement {
+    guard let app = t3AppPath() else { return .init(level: .bad, text: "Not installed") }
+    guard port != nil else {
+        return t3AppRunning(app)
+            ? .init(level: .bad, text: "Open, but its server isn't running")
+            : .init(level: .warn, text: "Not running — Remote access starts it")
+    }
     guard t3SignedIn() else { return .init(level: .bad, text: "Running, not signed in") }
     return .init(level: .ok, text: "Running, signed in")
 }
@@ -235,7 +335,11 @@ private func ensureHelper() -> String? {
 
 @MainActor
 final class RemoteController: ObservableObject {
+    /// What the user asked for. Stays on when Tailscale or T3 Code drops, so
+    /// the app can bring them back instead of silently giving up.
     @Published private(set) var enabled = false
+    @Published private(set) var pairing: Pairing?
+    private var checkedLaunchState = false
     @Published private(set) var busy = false
     @Published private(set) var steps: [SetupStep] = RemoteController.template
     @Published private(set) var tailscaleReq = Requirement(level: .warn, text: "Checking…")
@@ -255,15 +359,31 @@ final class RemoteController: ObservableObject {
     ]
 
     init() {
+        // Quit cleanup and tailgate://refresh need this before the popover ever opens.
+        AppDelegate.controller = self
+        // React the moment Tailscale or T3 Code launches or quits.
+        let center = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                let path = app?.bundleURL?.path ?? ""
+                guard path.hasSuffix("/Tailscale.app") || path.contains("/T3 Code") else { return }
+                Task { @MainActor in self?.refreshSoon() }
+            }
+        }
         Task { @MainActor [weak self] in
             await self?.refresh()
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 20 * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
                 guard let self else { return }
+                // A toggle or heal in flight owns the step list; don't clobber it.
+                guard !self.busy else { continue }
                 await self.refresh()
                 if self.enabled, !self.onAC, let pct = self.batteryPercent, pct <= drainCutoff {
                     self.lastError = "Remote access turned off at \(pct)% battery."
                     self.request(false)
+                } else if self.enabled, !self.busy, self.steps.contains(where: { $0.status != .ok }) {
+                    self.heal()
                 }
             }
         }
@@ -271,27 +391,47 @@ final class RemoteController: ObservableObject {
 
     // MARK: Reading state
 
+    /// Refresh now, unless a toggle or heal is mid-way (it refreshes when done).
+    /// Called on app launch/quit events and on tailgate://refresh from the doctor.
+    func refreshSoon() {
+        guard !busy else { return }
+        Task { @MainActor in await self.refresh() }
+    }
+
     func refresh() async {
         readPower()
         helperInstalled = FileManager.default.fileExists(atPath: helperPath)
         launchAtLogin = FileManager.default.fileExists(atPath: launchAgentURL.path)
 
         let ts = tailscaleInstalled ? await tailscaleState() : TailscaleState()
-        let served = await servedURL()
+        let port = t3ServerPort()
+        let served = await servedURL(port: port ?? t3DefaultPort)
         url = served
-        enabled = served != nil
 
         // Read from the kernel directly: no sudo, no helper, can't go stale.
         let live = runSync("/usr/bin/pmset", ["-g"]).out
-        let lidUp = live.range(of: "SleepDisabled[[:space:]]+1", options: .regularExpression) != nil
-        let t3 = portListening(t3Port)
+        var lidUp = live.range(of: "SleepDisabled[[:space:]]+1", options: .regularExpression) != nil
+
+        // An earlier run that was killed (not quit) can leave sharing or the
+        // sleep block behind: adopt the first, undo a lone second.
+        if !checkedLaunchState {
+            checkedLaunchState = true
+            if served != nil {
+                enabled = true
+            } else if lidUp, helperInstalled {
+                _ = await runTimed("/usr/bin/sudo", ["-n", helperPath, "off"], 15)
+                lidUp = false
+            }
+        }
+        if !enabled, pairing != nil { await revokePairing() }
+
         tailscaleReq = tailscaleRequirement(ts)
-        t3Req = t3Requirement(listening: t3)
+        t3Req = t3Requirement(port: port)
 
         steps = Self.template
         steps[0].status = lidUp ? .ok : .idle
         steps[1].status = ts.running ? .ok : .idle
-        steps[2].status = t3 ? .ok : .idle
+        steps[2].status = port != nil ? .ok : .idle
         steps[3].status = served != nil ? .ok : .idle
     }
 
@@ -308,12 +448,14 @@ final class RemoteController: ObservableObject {
     private func tailscaleState() async -> TailscaleState {
         let r = await runTimed(tailscaleBin, ["status", "--json"], 10)
         var s = TailscaleState()
+        s.appRunning = tailscaleAppRunning()
         guard let data = r.1.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return s
         }
         s.backend = obj["BackendState"] as? String ?? "Unknown"
         if let me = obj["Self"] as? [String: Any] {
+            s.online = me["Online"] as? Bool ?? false
             if let dns = me["DNSName"] as? String {
                 s.dnsName = dns.hasSuffix(".") ? String(dns.dropLast()) : dns
             }
@@ -322,7 +464,7 @@ final class RemoteController: ObservableObject {
         return s
     }
 
-    private func servedURL() async -> String? {
+    private func servedURL(port t3Port: Int) async -> String? {
         let r = await runTimed(tailscaleBin, ["serve", "status", "--json"], 10)
         guard let data = r.1.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -350,10 +492,53 @@ final class RemoteController: ObservableObject {
         busy = true
         lastError = nil
         Task { @MainActor in
-            if on { await self.turnOn() } else { await self.turnOff() }
+            if on { await self.turnOn(interactive: true) } else { await self.turnOff() }
             await self.refresh()
             self.busy = false
         }
+    }
+
+    /// Remote access is on but a piece dropped: quietly bring it back.
+    private func heal() {
+        busy = true
+        Task { @MainActor in
+            await self.turnOn(interactive: false)
+            await self.refresh()
+            if self.steps.allSatisfy({ $0.status == .ok }) { self.lastError = nil }
+            self.busy = false
+        }
+    }
+
+    /// Mints a fresh one-time link that pairs a new device with T3 Code.
+    func pairDevice() {
+        guard !busy else { return }
+        busy = true
+        lastError = nil
+        Task { @MainActor in
+            await self.newPairing()
+            self.busy = false
+        }
+    }
+
+    private func newPairing() async {
+        guard let app = t3AppPath(), let base = url else { return }
+        await revokePairing()
+        let cli = t3CLI(app, ["auth", "pairing", "create", "--json", "--ttl", pairingTTL,
+                              "--label", "Tailgate", "--base-url", base])
+        let r = await runTimed(cli.exe, cli.args, 30, env: cli.env)
+        if let p = parsePairing(r.1) {
+            pairing = p
+        } else {
+            lastError = "Could not create a pairing link. Use “Fix in Terminal…” to check T3 Code."
+        }
+    }
+
+    private func revokePairing() async {
+        guard let p = pairing else { return }
+        pairing = nil
+        guard p.expires > Date(), let app = t3AppPath() else { return }
+        let cli = t3CLI(app, ["auth", "pairing", "revoke", p.id])
+        _ = await runTimed(cli.exe, cli.args, 20, env: cli.env)
     }
 
     private func set(_ id: Int, _ status: StepStatus) {
@@ -367,12 +552,19 @@ final class RemoteController: ObservableObject {
         lastError = message
     }
 
-    private func turnOn() async {
+    /// Brings every piece up in order. `interactive` is a click on the toggle;
+    /// otherwise this is a background heal, which must not start a login,
+    /// restart an app the user has open, or mint a new pairing link.
+    private func turnOn(interactive: Bool) async {
         steps = Self.template
+        enabled = true
 
         // 1. helper + lid sleep
+        // Failing here turns the toggle back off: a heal retrying it would
+        // show the admin password prompt every 20 seconds.
         set(0, .running)
-        if let err = ensureHelper() {
+        if interactive, let err = ensureHelper() {
+            enabled = false
             fail(0, err)
             return
         }
@@ -380,6 +572,7 @@ final class RemoteController: ObservableObject {
         if lid.0 == 0 {
             set(0, .ok)
         } else {
+            enabled = false
             fail(0, "Could not disable lid sleep")
             return
         }
@@ -392,35 +585,53 @@ final class RemoteController: ObservableObject {
         }
         var ts = await tailscaleState()
         if !ts.running {
-            _ = await runTimed("/usr/bin/open", ["-a", "Tailscale"], 5)
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            // `up` prints/opens the login URL when the node needs auth; give the user time to finish.
-            _ = await runTimed(tailscaleBin, ["up", "--timeout=90s"], 100)
+            // -g: start in the background, never pull focus away from Tailgate.
+            _ = await runTimed("/usr/bin/open", ["-g", "-a", "Tailscale"], 5)
+            for _ in 0..<15 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                ts = await tailscaleState()
+                if ts.running || ["NeedsLogin", "NeedsMachineAuth", "Stopped"].contains(ts.backend) { break }
+            }
+        }
+        // A login opens the browser, so only start one when the user asked.
+        if !ts.running, interactive || ts.backend == "Stopped" {
+            await tailscaleUp(wait: interactive ? 90 : 30)
             ts = await tailscaleState()
         }
         guard ts.running, ts.dnsName != nil else {
             fail(1, ts.backend == "NeedsLogin"
                  ? "Tailscale needs you to sign in. Finish login in your browser, then toggle again."
-                 : "Tailscale is not connected. Open it and sign in.")
+                 : "Tailscale is not connected. Use “Fix in Terminal…” below.")
             return
         }
         set(1, .ok)
 
         // 3. t3 code
         set(2, .running)
-        guard t3AppInstalled() else {
+        guard let app = t3AppPath() else {
             fail(2, "T3 Code is not installed. Use “Fix in Terminal…” below.")
             return
         }
-        if !portListening(t3Port) {
-            _ = await runTimed("/usr/bin/open", ["-a", t3BundleName], 5)
-            for _ in 0..<20 {
+        var port = t3ServerPort()
+        if port == nil, interactive || !t3AppRunning(app) {
+            if !t3AppRunning(app) {
+                // `open` hands our environment to the app; ELECTRON_RUN_AS_NODE
+                // (inherited when Tailgate was started from a VS Code terminal)
+                // makes T3 Code exit at once.
+                var env = ProcessInfo.processInfo.environment
+                env["ELECTRON_RUN_AS_NODE"] = nil
+                _ = await runTimed("/usr/bin/open", ["-g", app], 5, env: env)
+            }
+            for _ in 0..<45 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if portListening(t3Port) { break }
+                port = t3ServerPort()
+                if port != nil { break }
             }
         }
-        guard portListening(t3Port) else {
-            fail(2, "T3 Code is not listening on port \(t3Port).")
+        guard let port else {
+            fail(2, t3AppRunning(app)
+                 ? "T3 Code is open but its server isn't running. “Fix in Terminal…” can restart it."
+                 : "T3 Code did not start. Use “Fix in Terminal…” below.")
             return
         }
         guard t3SignedIn() else {
@@ -431,24 +642,30 @@ final class RemoteController: ObservableObject {
 
         // 4. tailnet proxy
         set(3, .running)
-        if await servedURL() == nil {
-            let https = !ts.certDomains.isEmpty
-            let args = https
-                ? ["serve", "--bg", "--https=443", "\(t3Port)"]
-                : ["serve", "--bg", "--http=\(fallbackHTTPPort)", "\(t3Port)"]
+        var served = await servedURL(port: port)
+        if served == nil {
+            let args = ts.certDomains.isEmpty
+                ? ["serve", "--bg", "--http=\(fallbackHTTPPort)", "\(port)"]
+                : ["serve", "--bg", "--https=443", "\(port)"]
             _ = await runTimed(tailscaleBin, args, 25)
+            served = await servedURL(port: port)
         }
-        if let served = await servedURL() {
-            url = served
-            enabled = true
-            set(3, .ok)
-        } else {
-            fail(3, "Could not start the tailnet proxy.")
+        guard let served else {
+            fail(3, "Could not share T3 Code on your tailnet.")
+            return
+        }
+        url = served
+        set(3, .ok)
+
+        // 5. a fresh pairing link for the QR code; a heal keeps the current one
+        if interactive, (pairing?.expires ?? .distantPast) <= Date() {
+            await newPairing()
         }
     }
 
     private func turnOff() async {
         steps = Self.template
+        await revokePairing()
         _ = await runTimed(tailscaleBin, ["serve", "reset"], 15)
         if helperInstalled {
             _ = await runTimed("/usr/bin/sudo", ["-n", helperPath, "off"], 15)
@@ -460,6 +677,10 @@ final class RemoteController: ObservableObject {
     /// Quit path must be synchronous.
     func restoreOnQuit() {
         guard enabled || helperInstalled else { return }
+        if let p = pairing, p.expires > Date(), let app = t3AppPath() {
+            let cli = t3CLI(app, ["auth", "pairing", "revoke", p.id])
+            _ = runSync(cli.exe, cli.args, env: cli.env)
+        }
         _ = runSync(tailscaleBin, ["serve", "reset"])
         if helperInstalled {
             _ = runSync("/usr/bin/sudo", ["-n", helperPath, "off"])
@@ -477,7 +698,8 @@ final class RemoteController: ObservableObject {
         let url = launchAgentURL
         if on {
             let appPath = Bundle.main.bundlePath
-            let script = "/usr/bin/open -a 'Tailscale'; /usr/bin/open -a '\(t3BundleName)'; sleep 3; /usr/bin/open -a '\(appPath)'"
+            let t3 = t3AppPath().map { "/usr/bin/open -g '\($0)'; " } ?? ""
+            let script = "/usr/bin/open -g -a 'Tailscale'; \(t3)sleep 3; /usr/bin/open -a '\(appPath)'"
             let plist = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -584,6 +806,58 @@ struct StepRow: View {
     }
 }
 
+/// The one-time pairing QR code. The link grants full access to T3 Code, so
+/// it expires after a few minutes and is replaced by a button.
+struct PairingView: View {
+    @ObservedObject var model: RemoteController
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 15)) { context in
+            if let p = model.pairing, p.expires > context.date {
+                VStack(spacing: 6) {
+                    if let qr = qrImage(p.url) {
+                        Image(nsImage: qr)
+                            .interpolation(.none)
+                            .resizable()
+                            .frame(width: 132, height: 132)
+                            .padding(6)
+                            .background(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    Text("Scan with your phone's camera to pair it. One use, expires in \(minutesLeft(p.expires, from: context.date)).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Button("Copy link") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(p.url, forType: .string)
+                        }
+                        Button("New code") { model.pairDevice() }
+                            .disabled(model.busy)
+                    }
+                    .font(.caption)
+                    .buttonStyle(.link)
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                HStack {
+                    Button("Pair a device…") { model.pairDevice() }
+                        .disabled(model.busy)
+                    Spacer()
+                }
+                .font(.caption)
+            }
+        }
+    }
+
+    private func minutesLeft(_ expires: Date, from now: Date) -> String {
+        let m = max(1, Int(ceil(expires.timeIntervalSince(now) / 60)))
+        return m == 1 ? "1 minute" : "\(m) minutes"
+    }
+}
+
 private let appVersionLabel: String = {
     let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
     return "Tailgate \(v)"
@@ -652,6 +926,10 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            if model.enabled, model.url != nil {
+                PairingView(model: model)
+            }
+
             if let url = model.url {
                 HStack(spacing: 6) {
                     Text(url)
@@ -673,25 +951,15 @@ struct ContentView: View {
                     .buttonStyle(.link)
                 }
 
+                Text("Paired devices open this address.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
                 if url.hasPrefix("http://") {
                     Text("Plain HTTP inside the tailnet. Enable HTTPS in the Tailscale admin console for clipboard and install-as-app.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if let qr = qrImage(url) {
-                    HStack {
-                        Spacer()
-                        Image(nsImage: qr)
-                            .interpolation(.none)
-                            .resizable()
-                            .frame(width: 96, height: 96)
-                            .padding(6)
-                            .background(.white)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        Spacer()
-                    }
                 }
             }
 
@@ -777,6 +1045,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         previewWindow = window
+    }
+
+    /// tailgate://refresh — doctor.sh opens this when it finishes.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.contains(where: { $0.scheme == "tailgate" }) else { return }
+        Task { @MainActor in AppDelegate.controller?.refreshSoon() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -4,6 +4,67 @@ Menu bar app that makes this Mac reachable from your phone, tablet or another
 Mac: it keeps the lid awake, makes sure Tailscale is connected, makes sure
 T3 Code is running, and shares T3 Code on your tailnet (with a QR code).
 
+## Screenshots
+
+| Menu bar popover | Remote access on (QR code) |
+|--|--|
+| ![Tailgate popover with Tailscale and T3 Code health](docs/screenshots/popover.png) | ![Tailgate sharing T3 Code with a QR code](docs/screenshots/remote-on.png) |
+
+## Use case: open T3 Code from your phone
+
+### Private: over your tailnet (Tailscale Serve)
+
+This is what Tailgate does by default. Only devices signed in to your tailnet
+can reach it.
+
+1. Install Tailscale on your phone, sign in with the same account as the Mac,
+   and keep it connected (also on mobile data).
+2. On the Mac, click the Tailgate icon and turn on **Remote access**. Tailgate
+   connects Tailscale, starts T3 Code in the background and shares it.
+3. Scan the QR code with the phone's camera. It is a one-time T3 Code pairing
+   link that signs the phone in; it expires after 10 minutes. For another
+   device, click **Pair a device…** for a new code.
+4. From then on the phone just opens the address shown under the QR code, e.g.
+   `https://my-mac.tail1234.ts.net`. Close the lid and keep working.
+
+Under the hood this is the same as:
+
+```sh
+tailscale serve --bg --https=443 3773   # T3 Code listens on localhost:3773
+t3 auth pairing create --base-url https://my-mac.tail1234.ts.net   # the QR link
+```
+
+T3 Code only listens on `127.0.0.1`, so `http://my-mac:3773` won't work from
+the phone; it has to go through Tailscale Serve. If HTTPS certificates are not
+enabled for your tailnet, Tailgate falls back to
+`http://my-mac.tail1234.ts.net:8080`.
+
+If the phone can't load the page, check that its Tailscale app says
+*Connected*, then run `tailscale ping <phone-name>` on the Mac; no reply means
+the phone isn't on the tailnet.
+
+### Public: on the internet (Tailscale Funnel)
+
+Use Funnel when the other device can't run Tailscale, such as a borrowed
+laptop. Tailgate doesn't turn Funnel on for you; do it by hand after Remote
+access is on, and pair the device with **Pair a device…** as usual:
+
+```sh
+tailscale funnel --bg 3773   # same https://my-mac.tail1234.ts.net URL, now public
+tailscale funnel status
+```
+
+Funnel has to be allowed for this device in your tailnet policy (the `funnel`
+node attribute; the CLI prints a link to enable it if it isn't). Anyone with
+the URL can reach T3 Code's sign-in page, so turn it off when you're done:
+
+```sh
+tailscale funnel --https=443 off
+```
+
+Turning Remote access off or quitting Tailgate runs `tailscale serve reset`,
+which also removes the Funnel.
+
 ## Install
 
 ```sh
@@ -40,7 +101,11 @@ on runs the same prerequisites and stops with a specific message if one fails.
 ## Safety
 
 - Turns itself off at 15% battery when unplugged.
-- Quitting the app resets Tailscale Serve and restores normal sleep.
+- Quitting the app revokes an unused pairing link, resets Tailscale Serve and
+  restores normal sleep.
+- While Remote access is on, Tailgate restarts Tailscale or T3 Code in the
+  background if either drops. It never starts a login or restarts an app you
+  have open on its own; those show in the popover with **Fix in Terminal…**.
 - Only one instance runs; a second launch exits immediately.
 - The display still turns off; only system sleep is blocked. Keep the Mac on a
   hard surface, since a closed lid runs warm.
