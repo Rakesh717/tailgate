@@ -1795,19 +1795,8 @@ enum CLI {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static weak var controller: RemoteController?
     private var previewWindow: NSWindow?
-    /// Set when this copy quits because another is already running: it must
-    /// not run the quit cleanup, which would undo the other copy's state.
-    private var isDuplicate = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // One menu bar icon only: if another copy is already running, defer to it.
-        if let id = Bundle.main.bundleIdentifier,
-           NSRunningApplication.runningApplications(withBundleIdentifier: id)
-               .contains(where: { $0 != .current }) {
-            isDuplicate = true
-            NSApp.terminate(nil)
-            return
-        }
         guard CommandLine.arguments.contains("--preview") else { return }
         NSApp.setActivationPolicy(.regular)
         let model = RemoteController()
@@ -1832,7 +1821,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        guard !isDuplicate else { return }
         AppDelegate.controller?.restoreOnQuit()
         try? FileManager.default.removeItem(atPath: stateFile)
     }
@@ -1845,6 +1833,13 @@ enum Entry {
         if let i = CommandLine.arguments.firstIndex(of: "--cli") {
             exit(CLI.run(Array(CommandLine.arguments[(i + 1)...])))
         }
+        // One copy per user, whichever folder it runs from: a second copy
+        // exits here, before its model exists, so it can't touch the first
+        // copy's sleep, share or state. The lock lasts as long as the process.
+        try? FileManager.default.createDirectory(atPath: supportDir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        let lock = open(supportDir + "/app.lock", O_CREAT | O_RDWR, 0o600)
+        if lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0 { exit(0) }
         TailgateApp.main()
     }
 }

@@ -43,9 +43,12 @@ First release.
   Tailgate itself.
 
 **Install**
+- One-line installer: `curl -fsSL …/scripts/get.sh | sh` downloads the latest
+  release, verifies it and installs everything; running it again updates.
 - One admin prompt installs the sleep helper
   (`/usr/local/libexec/tailgate-helper`), a narrow `sudoers` rule and the
   `tailgate` command. `install.sh` and the app's first toggle both do it;
   `tailgate uninstall` removes everything.
+- Only one copy of the app runs per user, wherever it's launched from.
 - Universal binary (Apple silicon + Intel), hardened runtime, DMG and zip
   release script.

@@ -10,6 +10,33 @@ T3 Code is running, and shares T3 Code on your tailnet (with a QR code).
 |--|--|
 | ![Tailgate popover with Tailscale and T3 Code health](docs/screenshots/popover.png) | ![Tailgate sharing T3 Code with a QR code](docs/screenshots/remote-on.png) |
 
+## Install
+
+Needs macOS 13 or later, [Tailscale](https://tailscale.com/download/mac) and
+[T3 Code](https://t3.codes). If either is missing, `tailgate fix` offers to
+install it.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Rakesh717/tailgate/main/scripts/get.sh | sh
+```
+
+That downloads the latest release, checks it against the release's checksums
+and code signature, puts Tailgate in `/Applications` (or `~/Applications`),
+asks for your password once, launches it and runs `tailgate doctor`. Running it
+again updates in place.
+
+The password installs three small things: a root helper that toggles lid sleep
+(`/usr/local/libexec/tailgate-helper`), a narrow `sudoers` rule so Tailgate can
+use it without asking again, and the `tailgate` command
+(`/usr/local/bin/tailgate`, a link into the app).
+
+**Or download it:** get `Tailgate-<version>.dmg` from
+[Releases](https://github.com/Rakesh717/tailgate/releases) and drag Tailgate to
+Applications. The app isn't signed with an Apple Developer ID yet, so macOS
+blocks the first launch: open **System Settings → Privacy & Security** and click
+**Open Anyway**. Tailgate asks for your password the first time you turn on
+Remote access.
+
 ## Use case: open T3 Code from your phone
 
 ### Private: over your tailnet (Tailscale Serve)
@@ -64,19 +91,6 @@ tailscale funnel --https=443 off
 
 Turning Remote access off or quitting Tailgate removes only its own share
 (e.g. `tailscale serve --https=443 off`), so switch Funnel off yourself as above.
-
-## Install
-
-```sh
-./install.sh      # builds, copies to ~/Applications, launches, then runs the doctor
-```
-
-`install.sh` (or else the app's first toggle) asks for your admin password once
-and installs three things: a small root helper that toggles lid sleep
-(`/usr/local/libexec/tailgate-helper`), a narrow `sudoers` rule so later
-toggles are instant, and the `tailgate` command (`/usr/local/bin/tailgate`, a
-symlink into the app). By hand:
-`sudo sh ~/Applications/Tailgate.app/Contents/Resources/install-helper.sh`.
 
 ## Command line
 
@@ -193,16 +207,26 @@ sudo pmset -a disablesleep 0
 defaults delete com.rakesh717.tailgate
 ```
 
-## Releasing
+## Development
+
+```sh
+./install.sh      # builds, moves the app to ~/Applications, launches it, runs the doctor
+```
+
+Building needs Apple's command-line tools (`xcode-select --install`).
+`install.sh` also installs the helper and the `tailgate` command when they're
+missing or point elsewhere (it asks for your password).
+
+### Releasing
 
 ```sh
 echo 0.2.0 > VERSION                       # also add a CHANGELOG.md entry
 ./scripts/release.sh                       # dist/Tailgate-0.2.0.{dmg,zip} + SHA256SUMS
 ```
 
-That build is universal (Apple silicon + Intel) but only ad-hoc signed, so
-macOS asks users to right-click → Open the first time. For a trusted build you
-need an Apple Developer ID:
+That build is universal (Apple silicon + Intel) but only ad-hoc signed, so a
+downloaded DMG needs **Open Anyway** the first time (the `get.sh` installer
+avoids that). For a trusted build you need an Apple Developer ID:
 
 ```sh
 xcrun notarytool store-credentials tailgate --apple-id you@example.com --team-id TEAMID
@@ -212,7 +236,9 @@ SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=tail
 
 Pushing a tag `v0.2.0` runs `.github/workflows/release.yml`, which checks the
 tag against `VERSION`, builds, and attaches the artifacts to a GitHub release.
+`scripts/get.sh` and `tailgate update` install from exactly those files
+(`Tailgate-<version>.zip` and `SHA256SUMS`).
 
-## Icon
+### Icon
 
 `Resources/AppIcon.icns` is generated: `swift tools/make-icon.swift .`
