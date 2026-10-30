@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+- Remote access survives an internet outage. While the network is down,
+  Tailgate keeps the lid awake and the share in place and shows "Waiting for
+  Tailscale to reconnect…" until Tailscale comes back on its own. A restart
+  that fails only because Tailscale can't connect yet is retried instead of
+  turning Remote access off. A logout still turns it off.
+
 ## 0.1.0
 First release.
 

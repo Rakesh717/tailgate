@@ -127,6 +127,11 @@ struct TailscaleState {
     var dnsName: String?
     var certDomains: [String] = []
     var running: Bool { backend == "Running" && online && (appRunning || !appInstalled) }
+    /// Set up and running, just not connected: usually the network is down.
+    /// Tailscale reconnects on its own once it's back, so there's nothing to do.
+    var waitingForNetwork: Bool {
+        !running && (appRunning || !appInstalled) && ["Running", "Starting", "NoState"].contains(backend)
+    }
 }
 
 private func tailscaleAppPath() -> String? {
@@ -433,6 +438,7 @@ final class RemoteController: ObservableObject {
     private var stateObserver: AnyCancellable?
     private var stateWriteQueued = false
     private var shared: Share?
+    private var tailscale = TailscaleState()
     private var checkedLaunchState = false
     @Published private(set) var busy = false
     @Published private(set) var steps: [SetupStep] = RemoteController.template
@@ -514,6 +520,8 @@ final class RemoteController: ObservableObject {
         }
     }
 
+    static let reconnecting = "Waiting for Tailscale to reconnect…"
+
     /// Consecutive checks that found a piece down while Remote access is on.
     private var downChecks = 0
 
@@ -529,7 +537,19 @@ final class RemoteController: ObservableObject {
             shutDown("Remote access turned off at \(pct)% battery.")
             return
         }
-        guard steps.contains(where: { $0.status != .ok }) else { downChecks = 0; return }
+        guard steps.contains(where: { $0.status != .ok }) else {
+            downChecks = 0
+            if lastError == Self.reconnecting { lastError = nil }
+            return
+        }
+        // Network outage: keep the lid awake and the share in place and wait
+        // for Tailscale to come back by itself. A restart now would only time
+        // out and turn Remote access off.
+        if tailscale.waitingForNetwork {
+            downChecks = 0
+            lastError = Self.reconnecting
+            return
+        }
         downChecks += 1
         guard downChecks >= 2 else { return }
         downChecks = 0
@@ -539,7 +559,7 @@ final class RemoteController: ObservableObject {
         }
         busy = true
         Task { @MainActor in
-            await self.bringUp(newLink: false)
+            await self.bringUp(newLink: false, restarting: true)
             if !self.enabled {
                 self.lastError = "Remote access turned off: " + (self.lastError ?? "a restart failed.")
             }
@@ -589,6 +609,7 @@ final class RemoteController: ObservableObject {
         launchAtLogin = FileManager.default.fileExists(atPath: launchAgentURL.path)
 
         let ts = tailscaleInstalled ? await tailscaleState() : TailscaleState()
+        tailscale = ts
         let port = t3ServerPort()
         // Tailscale refuses serve changes while it's off, so a share that
         // turnOff couldn't remove is finished off as soon as it's back.
@@ -841,13 +862,19 @@ final class RemoteController: ObservableObject {
 
     /// turnOn, and if a step fails, undo the ones that worked (sleep, share) so
     /// the toggle is never left half on; the failure message is kept.
-    private func bringUp(newLink: Bool) async {
+    /// A `restarting` run that only failed to reconnect Tailscale stays on
+    /// instead: the network may still be down, and the next check retries.
+    /// A logout is still caught by setupProblem and turns it off.
+    private func bringUp(newLink: Bool, restarting: Bool = false) async {
         await turnOn(newLink: newLink)
-        if !steps.allSatisfy({ $0.status == .ok }) {
-            let error = lastError
-            await turnOff()
-            lastError = error
+        guard let failed = steps.first(where: { $0.status != .ok }) else { return }
+        if restarting, failed.id == 1 {
+            lastError = Self.reconnecting
+            return
         }
+        let error = lastError
+        await turnOff()
+        lastError = error
     }
 
     /// Brings every piece up in order, stopping at the first that fails.
