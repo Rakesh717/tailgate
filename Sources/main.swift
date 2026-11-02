@@ -223,10 +223,12 @@ private func t3ServerPort() -> Int? {
 }
 
 /// Signed in to T3 Code itself (the account token it writes after login).
+/// T3 Code 0.1.6 moved it from userdata/ into userdata/clerk/, so check both.
 private func t3SignedIn() -> Bool {
-    let path = t3Home + "/userdata/clerk-tokens.json"
-    let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int) ?? nil
-    return (size ?? 0) > 0
+    ["/userdata/clerk/clerk-tokens.json", "/userdata/clerk-tokens.json"].contains { rel in
+        let size = (try? FileManager.default.attributesOfItem(atPath: t3Home + rel)[.size] as? Int) ?? nil
+        return (size ?? 0) > 0
+    }
 }
 
 /// The CLI bundled in the T3 Code app, invoked the way its ~/.t3/bin/t3 shim does.

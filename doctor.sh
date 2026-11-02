@@ -239,7 +239,8 @@ if [ -n "$T3_APP" ]; then
   fi
 
   # Account sign-in
-  if [ -s "$T3_HOME/userdata/clerk-tokens.json" ]; then
+  # T3 Code 0.1.6 moved the token into userdata/clerk/; older versions kept it in userdata/.
+  if [ -s "$T3_HOME/userdata/clerk/clerk-tokens.json" ] || [ -s "$T3_HOME/userdata/clerk-tokens.json" ]; then
     ok "signed in to T3 Code"
   else
     bad "not signed in to T3 Code"

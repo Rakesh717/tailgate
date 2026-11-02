@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+- Fixes "Not signed in" showing for T3 Code when you are signed in. T3 Code
+  0.1.6 moved its sign-in token into a `clerk/` folder; Tailgate and
+  `doctor.sh` now look in both the new and the old location.
+
 ## 0.1.1
 - Remote access survives an internet outage. While the network is down,
   Tailgate keeps the lid awake and the share in place and shows "Waiting for
